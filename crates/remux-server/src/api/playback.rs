@@ -48,6 +48,17 @@ use crate::{
 };
 use axum_anyhow::ApiResult as Result;
 
+/// Infuse identifies its Emby/Jellyfin connection mode through the protocol
+/// client name. Keep the list explicit so unrelated clients retain the
+/// existing `MediaSourceId == item_id` auto-play behavior. `Infuse-Download`
+/// is deliberately excluded so offline-download behavior is untouched.
+fn is_infuse_client(app_name: &str) -> bool {
+    let app_name = app_name.trim();
+    app_name.eq_ignore_ascii_case("Infuse")
+        || app_name.eq_ignore_ascii_case("Infuse-Direct")
+        || app_name.eq_ignore_ascii_case("Infuse-Library")
+}
+
 #[post("/items/{id}/playbackinfo")]
 pub async fn items_playbackinfo(
     State(state): State<AppState>,
@@ -103,6 +114,26 @@ async fn items_playbackinfo_inner(
 ) -> Result<impl IntoResponse> {
     let media_source_id = q.media_source_id;
 
+    // Some Infuse item-page requests send MediaSourceId == item_id.
+    // For stream selection only, normalize that request to the existing
+    // no-MediaSourceId path, which enumerates all versions while probing only
+    // the first. Other clients retain the current one-source auto-play path.
+    let selection_requested_id = if media_source_id == Some(id)
+        && is_infuse_client(
+            &session
+                .device
+                .app_name,
+        ) {
+        debug!(
+            client = %session.device.app_name,
+            item_id = %id,
+            "enumerating all versions for Infuse item-level playback info request"
+        );
+        None
+    } else {
+        media_source_id
+    };
+
     trace!(?id, ?q, "items_playbackinfo");
 
     let device_profile = q
@@ -136,7 +167,7 @@ async fn items_playbackinfo_inner(
             .ctx
             .clone(),
         item_id: id,
-        requested_id: media_source_id,
+        requested_id: selection_requested_id,
         show_ungrouped,
         stream_filter: session
             .user
@@ -2101,6 +2132,61 @@ mod tests {
                 .id
                 .to_string(),
             "without MediaSourceId, ETag must equal the item id"
+        );
+
+        // Existing behavior is preserved for non-Infuse clients: an item-level
+        // MediaSourceId is the Android TV auto-play path and returns one source.
+        let generic_item_request = server
+            .post(&format!("/items/{}/playbackinfo", movie.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({ "MediaSourceId": movie.id.to_string() }))
+            .await;
+        generic_item_request.assert_status_ok();
+        let generic_body: serde_json::Value = generic_item_request.json();
+        assert_eq!(
+            generic_body["MediaSources"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "non-Infuse item-level request must retain the one-source behavior"
+        );
+
+        // Infuse-Direct uses the same item-level MediaSourceId while opening the
+        // detail page; it must receive every available version immediately.
+        let infuse_auth = format!(
+            "MediaBrowser Client=\"Infuse-Direct\", Device=\"Apple TV\", DeviceId=\"test-device\", Version=\"8.0\", Token=\"{}\"",
+            token
+        );
+        let infuse_item_request = server
+            .post(&format!("/items/{}/playbackinfo", movie.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&infuse_auth).unwrap(),
+            )
+            .json(&json!({ "MediaSourceId": movie.id.to_string() }))
+            .await;
+        infuse_item_request.assert_status_ok();
+        let infuse_body: serde_json::Value = infuse_item_request.json();
+        assert_eq!(
+            infuse_body["MediaSources"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2,
+            "Infuse item-level request must enumerate all versions"
+        );
+        assert_eq!(
+            infuse_body["MediaSources"][0]["Id"]
+                .as_str()
+                .unwrap(),
+            movie
+                .id
+                .to_string(),
+            "Infuse must retain the item id on the first source for auto-play routing"
         );
     }
 
