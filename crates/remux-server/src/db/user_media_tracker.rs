@@ -83,12 +83,18 @@ pub struct UserMediaTracker {
     pub last_error_at: Option<NaiveDateTime>,
     pub last_error: Option<String>,
     pub last_error_kind: Option<MediaTrackerErrorKind>,
+    /// Watermark of the last successful pull of remote changes. `None` until
+    /// the first import, which is what makes the next pull a full one.
+    pub last_pull_at: Option<NaiveDateTime>,
+    /// The remote account, as the provider labels it ("Connected as …").
+    pub account_name: Option<String>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }
 
 const COLS: &str = "id, addon_id, user_id, status, credentials, event_filters, \
-     last_success_at, last_error_at, last_error, last_error_kind, created_at, updated_at";
+     last_success_at, last_error_at, last_error, last_error_kind, \
+     last_pull_at, account_name, created_at, updated_at";
 
 impl UserMediaTracker {
     pub fn new(
@@ -109,6 +115,8 @@ impl UserMediaTracker {
             last_error_at: None,
             last_error: None,
             last_error_kind: None,
+            last_pull_at: None,
+            account_name: None,
             created_at: now,
             updated_at: now,
         }
@@ -181,18 +189,25 @@ impl UserMediaTracker {
 
     /// Insert, or replace the credentials and filters of an existing
     /// connection. Reconnecting keeps the row so its id stays stable for
-    /// anything referencing it.
+    /// anything referencing it, and clears the pull watermark: the new
+    /// credentials may belong to a different account, whose history has not
+    /// been seen.
     pub async fn upsert(&self, db: &SqlitePool) -> Result<()> {
         sqlx::query(
             "INSERT INTO user_media_trackers \
              (id, addon_id, user_id, status, credentials, event_filters, \
               last_success_at, last_error_at, last_error, last_error_kind, \
-              created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+              last_pull_at, account_name, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
              ON CONFLICT(addon_id, user_id) DO UPDATE SET \
                  status = excluded.status, \
                  credentials = excluded.credentials, \
                  event_filters = excluded.event_filters, \
+                 account_name = excluded.account_name, \
+                 last_pull_at = NULL, \
+                 last_error = NULL, \
+                 last_error_at = NULL, \
+                 last_error_kind = NULL, \
                  updated_at = excluded.updated_at",
         )
         .bind(self.id)
@@ -205,6 +220,8 @@ impl UserMediaTracker {
         .bind(self.last_error_at)
         .bind(&self.last_error)
         .bind(self.last_error_kind)
+        .bind(self.last_pull_at)
+        .bind(&self.account_name)
         .bind(self.created_at)
         .bind(self.updated_at)
         .execute(db)
@@ -226,6 +243,29 @@ impl UserMediaTracker {
         .bind(id)
         .bind(sqlx::types::Json(filters))
         .bind(Utc::now().naive_utc())
+        .execute(db)
+        .await?;
+        Ok(())
+    }
+
+    /// A pull of remote changes went through: the connection is healthy and
+    /// the next delta starts at `pulled_at`, the instant the pull began.
+    pub async fn mark_pull_success(
+        db: &SqlitePool,
+        id: Uuid,
+        pulled_at: NaiveDateTime,
+    ) -> Result<()> {
+        let now = Utc::now().naive_utc();
+        sqlx::query(
+            "UPDATE user_media_trackers \
+             SET status = 'connected', last_success_at = ?2, last_pull_at = ?3, \
+                 last_error = NULL, last_error_at = NULL, last_error_kind = NULL, \
+                 updated_at = ?2 \
+             WHERE id = ?1",
+        )
+        .bind(id)
+        .bind(now)
+        .bind(pulled_at)
         .execute(db)
         .await?;
         Ok(())
@@ -399,6 +439,60 @@ mod tests {
                 .get_str("token"),
             Some("new")
         );
+    }
+
+    #[tokio::test]
+    async fn a_pull_moves_the_watermark_and_a_reconnect_clears_it() {
+        let (_srv, guard) = new_test_server()
+            .await
+            .unwrap();
+        let db = &guard
+            .0
+            .db;
+        let addon = seed_addon(db).await;
+        let user = seed_user(db, "alice").await;
+
+        let mut row = UserMediaTracker::new(user, addon, creds("a"), vec![]);
+        row.account_name = Some("alice@simkl".into());
+        row.upsert(db)
+            .await
+            .unwrap();
+        let got = UserMediaTracker::get(db, row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.last_pull_at, None, "nothing pulled yet");
+        assert_eq!(
+            got.account_name
+                .as_deref(),
+            Some("alice@simkl")
+        );
+
+        let pulled_at = Utc::now().naive_utc();
+        UserMediaTracker::mark_pull_success(db, row.id, pulled_at)
+            .await
+            .unwrap();
+        let got = UserMediaTracker::get(db, row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.last_pull_at, Some(pulled_at));
+        assert!(
+            got.last_success_at
+                .is_some()
+        );
+
+        // New credentials may be a different account: start over.
+        UserMediaTracker::new(user, addon, creds("b"), vec![])
+            .upsert(db)
+            .await
+            .unwrap();
+        let got = UserMediaTracker::get(db, row.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.last_pull_at, None);
+        assert_eq!(got.account_name, None);
     }
 
     #[tokio::test]

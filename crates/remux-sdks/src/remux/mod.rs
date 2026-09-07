@@ -165,6 +165,270 @@ impl Endpoint for DeleteWebhook {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Media trackers (Simkl, …): a user's connections to tracking services.
+// Event kinds, auth flows and statuses travel as their snake_case strings so
+// the dashboard needs no server types.
+// ---------------------------------------------------------------------------
+
+/// One installed addon that can track watch activity, as offered to a user.
+#[skip_serializing_none]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaTrackerProviderDto {
+    pub addon_id: Uuid,
+    pub name: String,
+    /// The preset id, e.g. `simkl`.
+    pub kind: String,
+    /// `token`, `oauth_device_code` or `oauth_redirect`.
+    pub auth_flow: String,
+    /// `token` flows only: what the connect form asks for.
+    #[serde(default)]
+    pub connect_fields: Vec<AddonOption>,
+    #[serde(default)]
+    pub supported_events: Vec<String>,
+    #[serde(default)]
+    pub default_event_filter: Vec<String>,
+    /// Whether the provider can hand back the user's existing history.
+    #[serde(default)]
+    pub history_import: bool,
+    /// Whether changes made on the provider's side flow back into remux.
+    #[serde(default)]
+    pub pulls_changes: bool,
+}
+
+#[skip_serializing_none]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserMediaTrackerDto {
+    pub id: Uuid,
+    pub addon_id: Uuid,
+    pub user_id: Uuid,
+    /// `connected`, `auth_expired`, `error` or `disconnected`.
+    pub status: String,
+    #[serde(default)]
+    pub event_filters: Vec<String>,
+    /// The remote account, when the provider reports one.
+    pub account_name: Option<String>,
+    pub last_success_at: Option<NaiveDateTime>,
+    pub last_error_at: Option<NaiveDateTime>,
+    pub last_error: Option<String>,
+    /// `retryable` or `permanent`.
+    pub last_error_kind: Option<String>,
+    /// When remote changes were last pulled; `None` before the first import.
+    pub last_pull_at: Option<NaiveDateTime>,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserMediaTrackersDto {
+    #[serde(default)]
+    pub providers: Vec<MediaTrackerProviderDto>,
+    #[serde(default)]
+    pub connections: Vec<UserMediaTrackerDto>,
+}
+
+/// What to show the user while a device-code login is pending.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaTrackerDeviceAuthDto {
+    pub verification_url: String,
+    pub user_code: String,
+    /// Opaque; send it back on every poll.
+    pub poll_token: String,
+    /// Poll no faster than this.
+    pub interval_secs: u64,
+    pub expires_in_secs: u64,
+}
+
+#[skip_serializing_none]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaTrackerDevicePollRequest {
+    pub poll_token: String,
+    /// Event kinds to sync once approved; the provider's default when absent.
+    pub event_filters: Option<Vec<String>>,
+}
+
+#[skip_serializing_none]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaTrackerDevicePollDto {
+    /// `pending`, `approved` or `denied`. `denied` means start over.
+    pub status: String,
+    /// Set once approved.
+    pub connection: Option<UserMediaTrackerDto>,
+}
+
+#[skip_serializing_none]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaTrackerTokenConnectRequest {
+    /// Values for the provider's `connect_fields`, keyed by option id.
+    pub fields: serde_json::Value,
+    pub event_filters: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateMediaTrackerRequest {
+    pub event_filters: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaTrackerSyncRequest {
+    /// Re-read everything instead of only what changed since the last pull.
+    #[serde(default)]
+    pub full: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaTrackerSyncStartedDto {
+    pub started: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct GetUserMediaTrackers {
+    pub user_id: Uuid,
+}
+impl Endpoint for GetUserMediaTrackers {
+    type Output = UserMediaTrackersDto;
+    fn path(&self) -> String {
+        format!("/remux/users/{}/mediatrackers", self.user_id)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BeginMediaTrackerDeviceAuth {
+    pub user_id: Uuid,
+    pub addon_id: Uuid,
+}
+impl Endpoint for BeginMediaTrackerDeviceAuth {
+    type Output = MediaTrackerDeviceAuthDto;
+    fn path(&self) -> String {
+        format!(
+            "/remux/users/{}/mediatrackers/providers/{}/device",
+            self.user_id, self.addon_id
+        )
+    }
+    fn method(&self) -> Method {
+        Method::POST
+    }
+    fn body(&self) -> Body {
+        Body::Json(serde_json::json!({}))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PollMediaTrackerDeviceAuth {
+    pub user_id: Uuid,
+    pub addon_id: Uuid,
+    pub request: MediaTrackerDevicePollRequest,
+}
+impl Endpoint for PollMediaTrackerDeviceAuth {
+    type Output = MediaTrackerDevicePollDto;
+    fn path(&self) -> String {
+        format!(
+            "/remux/users/{}/mediatrackers/providers/{}/device/poll",
+            self.user_id, self.addon_id
+        )
+    }
+    fn method(&self) -> Method {
+        Method::POST
+    }
+    fn body(&self) -> Body {
+        Body::Json(serde_json::to_value(&self.request).unwrap_or_default())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ConnectMediaTrackerWithToken {
+    pub user_id: Uuid,
+    pub addon_id: Uuid,
+    pub request: MediaTrackerTokenConnectRequest,
+}
+impl Endpoint for ConnectMediaTrackerWithToken {
+    type Output = UserMediaTrackerDto;
+    fn path(&self) -> String {
+        format!(
+            "/remux/users/{}/mediatrackers/providers/{}/token",
+            self.user_id, self.addon_id
+        )
+    }
+    fn method(&self) -> Method {
+        Method::POST
+    }
+    fn body(&self) -> Body {
+        Body::Json(serde_json::to_value(&self.request).unwrap_or_default())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateMediaTracker {
+    pub user_id: Uuid,
+    pub id: Uuid,
+    pub request: UpdateMediaTrackerRequest,
+}
+impl Endpoint for UpdateMediaTracker {
+    type Output = UserMediaTrackerDto;
+    fn path(&self) -> String {
+        format!(
+            "/remux/users/{}/mediatrackers/connections/{}",
+            self.user_id, self.id
+        )
+    }
+    fn method(&self) -> Method {
+        Method::PUT
+    }
+    fn body(&self) -> Body {
+        Body::Json(serde_json::to_value(&self.request).unwrap_or_default())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DisconnectMediaTracker {
+    pub user_id: Uuid,
+    pub id: Uuid,
+}
+impl Endpoint for DisconnectMediaTracker {
+    type Output = serde_json::Value;
+    fn path(&self) -> String {
+        format!(
+            "/remux/users/{}/mediatrackers/connections/{}",
+            self.user_id, self.id
+        )
+    }
+    fn method(&self) -> Method {
+        Method::DELETE
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SyncMediaTracker {
+    pub user_id: Uuid,
+    pub id: Uuid,
+    pub full: bool,
+}
+impl Endpoint for SyncMediaTracker {
+    type Output = MediaTrackerSyncStartedDto;
+    fn path(&self) -> String {
+        format!(
+            "/remux/users/{}/mediatrackers/connections/{}/sync",
+            self.user_id, self.id
+        )
+    }
+    fn method(&self) -> Method {
+        Method::POST
+    }
+    fn body(&self) -> Body {
+        Body::Json(serde_json::json!({ "full": self.full }))
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreviewWebhook {

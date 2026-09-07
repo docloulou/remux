@@ -191,10 +191,15 @@ pub struct MediaTrackerTarget {
     pub title: String,
     pub year: Option<i32>,
     pub ids: db::ExternalIds,
-    /// Set for episodes: the parent series' title, year and ids.
+    /// Set for episodes and seasons: the parent series' title, year and ids.
     pub series: Option<Box<MediaTrackerTarget>>,
+    /// The season number: an episode's parent, or a season's own index.
     pub season: Option<i64>,
+    /// Episodes only.
     pub episode: Option<i64>,
+    /// Lets a provider turn a playback position into a percentage, which is
+    /// what scrobbling services take.
+    pub runtime_seconds: Option<i64>,
 }
 
 /// Whether any id here is one a media tracker could key on. `ExternalIds`
@@ -224,21 +229,49 @@ impl MediaTrackerTarget {
                 .as_ref()
                 .is_some_and(|s| has_media_tracker_ids(&s.ids))
     }
+
+    /// `position_ticks` as a percentage of the runtime, for providers that
+    /// take progress rather than a position. `None` when the runtime is
+    /// unknown, so a caller can tell "unknown" from "at the start".
+    pub fn progress_percent(&self, position_ticks: i64) -> Option<f64> {
+        const TICKS_PER_SECOND: f64 = 10_000_000.0;
+        let runtime = self
+            .runtime_seconds
+            .filter(|r| *r > 0)? as f64;
+        let seconds = position_ticks.max(0) as f64 / TICKS_PER_SECOND;
+        Some((seconds / runtime * 100.0).clamp(0.0, 100.0))
+    }
 }
 
 /// Opaque to core: a static webhook token and an OAuth triple look the same.
 pub type MediaTrackerCredentials = remux_utils::Secret<serde_json::Value>;
 
 /// Drives which connect UI the dashboard renders, without it knowing the
-/// provider.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// provider. The string form is what the API sends.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    strum_macros::Display,
+    strum_macros::EnumString,
+    Serialize,
+    Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum AuthFlow {
     /// User pastes a value, described by `connect_fields`.
     Token,
     /// User enters a code on the provider's site; server polls. Suits TV
     /// clients with no browser.
+    #[serde(rename = "oauth_device_code")]
+    #[strum(serialize = "oauth_device_code")]
     OAuthDeviceCode,
     /// Redirect plus callback. Needs a publicly reachable server.
+    #[serde(rename = "oauth_redirect")]
+    #[strum(serialize = "oauth_redirect")]
     OAuthRedirect,
 }
 
@@ -404,6 +437,13 @@ pub trait MediaTrackerAddon: AddonKind + Send + Sync {
         _ctx: &MediaTrackerCtx,
     ) -> MediaTrackerResult<()> {
         Ok(())
+    }
+
+    /// The remote account these credentials belong to, as shown next to the
+    /// connection ("Connected as alice"). No I/O: read it out of what
+    /// `poll_device_auth` or `connect_with_token` stored.
+    fn account_label(&self, _creds: &MediaTrackerCredentials) -> Option<String> {
+        None
     }
 
     async fn on_event(
@@ -625,6 +665,7 @@ mod tests {
             series: None,
             season: None,
             episode: None,
+            runtime_seconds: None,
         }
     }
 
@@ -686,6 +727,37 @@ mod tests {
             )
             .is_matchable()
         );
+    }
+
+    /// The dashboard branches on these strings, so they are part of the API.
+    #[test]
+    fn auth_flows_have_stable_wire_names() {
+        for (flow, name) in [
+            (AuthFlow::Token, "token"),
+            (AuthFlow::OAuthDeviceCode, "oauth_device_code"),
+            (AuthFlow::OAuthRedirect, "oauth_redirect"),
+        ] {
+            assert_eq!(flow.to_string(), name);
+            assert_eq!(
+                name.parse::<AuthFlow>()
+                    .unwrap(),
+                flow
+            );
+            assert_eq!(serde_json::to_string(&flow).unwrap(), format!("\"{name}\""));
+        }
+    }
+
+    /// Scrobbling services take a percentage; ticks are what playback reports.
+    #[test]
+    fn progress_is_a_bounded_percentage_of_the_runtime() {
+        let mut t = target(db::MediaKind::Movie, db::ExternalIds::default());
+        assert_eq!(t.progress_percent(10_000_000), None, "unknown runtime");
+        t.runtime_seconds = Some(0);
+        assert_eq!(t.progress_percent(10_000_000), None, "zero runtime");
+        t.runtime_seconds = Some(200);
+        assert_eq!(t.progress_percent(100 * 10_000_000), Some(50.0));
+        assert_eq!(t.progress_percent(-5), Some(0.0));
+        assert_eq!(t.progress_percent(1_000 * 10_000_000), Some(100.0));
     }
 
     #[test]

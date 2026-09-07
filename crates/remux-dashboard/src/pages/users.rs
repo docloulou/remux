@@ -1,4 +1,8 @@
-use crate::{components::*, pages::streams::StreamFilterEditor, state::AppState};
+use crate::{
+    components::*,
+    pages::{media_trackers::MediaTrackersPanel, streams::StreamFilterEditor},
+    state::AppState,
+};
 use dioxus::prelude::*;
 use remux_sdks::remux::{
     AddonDto, AdminSetPassword, CollectionFilter, CreateUser, DeleteUser, FilterGroup,
@@ -388,6 +392,8 @@ pub fn UserForm(
             }
         });
     });
+
+    let trackers_client = app_state.clone();
 
     let on_submit = move |e: Event<FormData>| {
         e.prevent_default();
@@ -847,6 +853,13 @@ pub fn UserForm(
                             }
                         }
                     }
+                }
+            }
+
+            if let Some(uid) = edit_user_id {
+                MediaTrackersPanel {
+                    app_state: trackers_client.clone(),
+                    user_id: uid,
                 }
             }
 
