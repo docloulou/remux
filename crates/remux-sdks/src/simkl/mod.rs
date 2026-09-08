@@ -9,6 +9,7 @@
 use crate::{Auth, Body, ClientError, Endpoint, RestClient};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use http::Method;
+use remux_utils::Secret;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_with::skip_serializing_none;
 
@@ -66,11 +67,10 @@ impl Auth for SimklAuth {
 }
 
 /// Simkl error bodies are `{"error": "...", "code": 412, "message": "..."}`.
-/// The docs say to branch on `error`, so it leads the message.
+/// The docs say to branch on `error`, so it leads the message. 401 and 429
+/// never reach here: `RestClient` turns them into `Unauthorized` and
+/// `RateLimited` before consulting the mapper.
 fn simkl_error_mapper(status: u16, endpoint: &str, body: &str) -> ClientError {
-    if status == 401 {
-        return ClientError::Unauthorized;
-    }
     #[derive(Deserialize)]
     struct ErrorBody {
         error: Option<String>,
@@ -191,6 +191,34 @@ fn flexible_datetime<'de, D: Deserializer<'de>>(
         Some(serde_json::Value::String(s)) => parse_datetime(&s),
         _ => None,
     })
+}
+
+/// A count that some endpoints report as a number and others (add-to-list)
+/// as the array of items acted on.
+fn flexible_count<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
+    let v = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(match v {
+        Some(serde_json::Value::Number(n)) => n.as_i64(),
+        Some(serde_json::Value::Array(items)) => Some(items.len() as i64),
+        Some(serde_json::Value::String(s)) => s
+            .trim()
+            .parse::<i64>()
+            .ok(),
+        _ => None,
+    })
+}
+
+/// Whole seconds, UTC, `Z` suffix: the shape every documented example uses.
+fn rfc3339_secs<S: serde::Serializer>(
+    v: &Option<DateTime<Utc>>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    match v {
+        Some(d) => {
+            s.serialize_str(&d.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        }
+        None => s.serialize_none(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -356,7 +384,7 @@ pub struct PinPoll {
 pub struct PinPollResponse {
     #[serde(default)]
     pub result: String,
-    pub access_token: Option<String>,
+    pub access_token: Option<Secret<String>>,
     pub message: Option<String>,
     /// Present when Simkl no longer knows the code: it answers with a fresh
     /// initialisation instead of an error.
@@ -368,7 +396,7 @@ pub struct PinPollResponse {
 pub enum PinStatus {
     Pending,
     Approved {
-        access_token: String,
+        access_token: Secret<String>,
     },
     /// The code expired, was already consumed, or was never issued.
     Expired,
@@ -382,11 +410,14 @@ impl PinPollResponse {
         {
             if let Some(token) = self
                 .access_token
-                .as_deref()
-                .filter(|t| !t.is_empty())
+                .as_ref()
+                .filter(|t| {
+                    !t.expose()
+                        .is_empty()
+                })
             {
                 return PinStatus::Approved {
-                    access_token: token.to_string(),
+                    access_token: token.clone(),
                 };
             }
         }
@@ -423,7 +454,7 @@ pub struct TokenExchange {
 #[skip_serializing_none]
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TokenResponse {
-    pub access_token: String,
+    pub access_token: Secret<String>,
     pub token_type: Option<String>,
     pub scope: Option<String>,
     #[serde(default, deserialize_with = "flexible_i64")]
@@ -565,6 +596,9 @@ impl Endpoint for Activities {
 #[serde(rename_all = "snake_case")]
 pub enum Extended {
     Full,
+    /// `full` plus, on every anime episode, where it sits in TVDB's
+    /// season/episode scheme.
+    FullAnimeSeasons,
     IdsOnly,
     SimklIdsOnly,
 }
@@ -586,13 +620,14 @@ pub struct AllItems {
 
 impl AllItems {
     /// Everything a two-way sync needs: full entries with dated episodes,
-    /// including the shows already finished.
+    /// including the shows already finished, and anime episodes mapped onto
+    /// TVDB seasons.
     pub fn for_sync(date_from: Option<DateTime<Utc>>) -> Self {
         Self {
             kind: None,
             status: None,
             date_from,
-            extended: Some(Extended::Full),
+            extended: Some(Extended::FullAnimeSeasons),
             episode_watched_at: true,
             include_all_episodes: true,
         }
@@ -615,7 +650,8 @@ impl Endpoint for AllItems {
         match (self.kind, self.status) {
             (Some(kind), Some(status)) => format!("sync/all-items/{kind}/{status}"),
             (Some(kind), None) => format!("sync/all-items/{kind}"),
-            _ => "sync/all-items".to_string(),
+            (None, Some(status)) => format!("sync/all-items/all/{status}"),
+            (None, None) => "sync/all-items".to_string(),
         }
     }
 
@@ -814,6 +850,7 @@ impl<'de> Deserialize<'de> for AllItemsResponse {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SyncEpisode {
     pub number: i64,
+    #[serde(default, serialize_with = "rfc3339_secs")]
     pub watched_at: Option<DateTime<Utc>>,
 }
 
@@ -832,10 +869,14 @@ pub struct SyncMovie {
     pub year: Option<i64>,
     #[serde(default)]
     pub ids: SimklIds,
+    #[serde(default, serialize_with = "rfc3339_secs")]
     pub watched_at: Option<DateTime<Utc>>,
     /// 1-10.
     pub rating: Option<u8>,
+    #[serde(default, serialize_with = "rfc3339_secs")]
     pub rated_at: Option<DateTime<Utc>>,
+    /// `add-to-list` only: the bucket this item goes to.
+    pub to: Option<ListStatus>,
 }
 
 #[skip_serializing_none]
@@ -850,7 +891,10 @@ pub struct SyncShow {
     pub seasons: Option<Vec<SyncSeason>>,
     /// 1-10.
     pub rating: Option<u8>,
+    #[serde(default, serialize_with = "rfc3339_secs")]
     pub rated_at: Option<DateTime<Utc>>,
+    /// `add-to-list` only: the bucket this item goes to.
+    pub to: Option<ListStatus>,
 }
 
 /// Body shared by every `/sync/*` write. Anime goes under `shows`; Simkl
@@ -858,8 +902,6 @@ pub struct SyncShow {
 #[skip_serializing_none]
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SyncPayload {
-    /// `add-to-list` only: the target bucket.
-    pub to: Option<ListStatus>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub movies: Vec<SyncMovie>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -879,11 +921,11 @@ impl SyncPayload {
 #[skip_serializing_none]
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SyncCounts {
-    #[serde(default, deserialize_with = "flexible_i64")]
+    #[serde(default, deserialize_with = "flexible_count")]
     pub movies: Option<i64>,
-    #[serde(default, deserialize_with = "flexible_i64")]
+    #[serde(default, deserialize_with = "flexible_count")]
     pub shows: Option<i64>,
-    #[serde(default, deserialize_with = "flexible_i64")]
+    #[serde(default, deserialize_with = "flexible_count")]
     pub episodes: Option<i64>,
 }
 
@@ -998,7 +1040,7 @@ sync_write_endpoint!(
 sync_write_endpoint!(
     AddToList,
     "sync/add-to-list",
-    "`POST /sync/add-to-list`: move items into the bucket named by `to`."
+    "`POST /sync/add-to-list`: move each item into the bucket its own `to` names. The response lists the items instead of counting them."
 );
 sync_write_endpoint!(
     RemoveFromList,
@@ -1254,14 +1296,18 @@ mod tests {
         assert_eq!(slow.status(), PinStatus::Pending);
 
         let approved: PinPollResponse = serde_json::from_value(serde_json::json!({
-            "result": "OK", "access_token": "tok"
+            "result": "OK", "access_token": "s3cr3t"
         }))
         .unwrap();
         assert_eq!(
             approved.status(),
             PinStatus::Approved {
-                access_token: "tok".into()
+                access_token: Secret::new("s3cr3t".into())
             }
+        );
+        assert!(
+            !format!("{:?}", approved.status()).contains("s3cr3t"),
+            "a token must not be printable"
         );
 
         // A fresh initialisation is how Simkl says the old code is gone.
@@ -1417,7 +1463,7 @@ mod tests {
         assert_eq!(ep.path(), "sync/all-items");
         let q = ep.query();
         assert!(q.contains(&("date_from".into(), "2026-05-14T06%3A50%3A38Z".into())));
-        assert!(q.contains(&("extended".into(), "full".into())));
+        assert!(q.contains(&("extended".into(), "full_anime_seasons".into())));
         assert!(q.contains(&("episode_watched_at".into(), "yes".into())));
         assert!(q.contains(&("include_all_episodes".into(), "yes".into())));
 
@@ -1432,6 +1478,11 @@ mod tests {
                 .query()
                 .is_empty()
         );
+        let status_only = AllItems {
+            status: Some(ListStatus::Completed),
+            ..Default::default()
+        };
+        assert_eq!(status_only.path(), "sync/all-items/all/completed");
     }
 
     #[test]
@@ -1456,7 +1507,6 @@ mod tests {
     #[test]
     fn history_payload_omits_what_was_not_set() {
         let payload = SyncPayload {
-            to: None,
             movies: vec![SyncMovie {
                 title: Some("Heat".into()),
                 year: Some(1995),
@@ -1468,6 +1518,7 @@ mod tests {
                 watched_at: None,
                 rating: None,
                 rated_at: None,
+                to: None,
             }],
             shows: vec![SyncShow {
                 title: None,
@@ -1486,6 +1537,7 @@ mod tests {
                 }]),
                 rating: None,
                 rated_at: None,
+                to: None,
             }],
         };
         let json = serde_json::to_value(&payload).unwrap();
@@ -1510,15 +1562,28 @@ mod tests {
         );
     }
 
+    /// Simkl rejects a top-level `to`; each item names its own bucket.
     #[test]
-    fn add_to_list_names_its_bucket() {
+    fn add_to_list_names_each_items_bucket() {
         let json = serde_json::to_value(&AddToList(SyncPayload {
-            to: Some(ListStatus::Plantowatch),
-            movies: vec![SyncMovie::default()],
+            movies: vec![SyncMovie {
+                to: Some(ListStatus::Plantowatch),
+                ..Default::default()
+            }],
             shows: vec![],
         }))
         .unwrap();
-        assert_eq!(json["to"], "plantowatch");
+        assert_eq!(json["movies"][0]["to"], "plantowatch");
+        assert!(
+            json.get("to")
+                .is_none()
+        );
+        let listed: SyncResponse = serde_json::from_value(serde_json::json!({
+            "added": {"movies": [{"to": "plantowatch", "ids": {"simkl": 1}}], "shows": []},
+            "not_found": {"movies": [], "shows": []}
+        }))
+        .unwrap();
+        assert_eq!(listed.affected(), 1);
         assert_eq!(AddToList::default().path(), "sync/add-to-list");
         assert_eq!(RemoveFromList::default().path(), "sync/remove-from-list");
         assert_eq!(AddRatings::default().path(), "sync/ratings");
@@ -1680,5 +1745,35 @@ mod tests {
         assert!(parse_datetime("2026-05-14 06:50:38").is_some());
         assert!(parse_datetime("").is_none());
         assert!(parse_datetime("yesterday").is_none());
+    }
+
+    /// Dates go out as whole seconds with a `Z`, the way the docs show them.
+    #[test]
+    fn write_timestamps_carry_no_fractional_seconds() {
+        let at = DateTime::parse_from_rfc3339("2026-09-07T10:11:12.482913554Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let movie = serde_json::to_value(SyncMovie {
+            watched_at: Some(at),
+            rated_at: Some(at),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(movie["watched_at"], "2026-09-07T10:11:12Z");
+        assert_eq!(movie["rated_at"], "2026-09-07T10:11:12Z");
+        let episode = serde_json::to_value(SyncEpisode {
+            number: 1,
+            watched_at: Some(at),
+        })
+        .unwrap();
+        assert_eq!(episode["watched_at"], "2026-09-07T10:11:12Z");
+        // And still read back.
+        let back: SyncMovie = serde_json::from_value(movie).unwrap();
+        assert_eq!(
+            back.watched_at
+                .unwrap()
+                .timestamp(),
+            at.timestamp()
+        );
     }
 }

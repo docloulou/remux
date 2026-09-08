@@ -190,7 +190,16 @@ pub async fn report_playback_progress(
             .ctx
             .signals
             .emit(Event::SessionsChanged);
-        if data.is_paused && !was_paused {
+        // Only the transitions are events: a pause, and the resume after it.
+        // Clients keep reporting position either way, which is not news.
+        let transition = if data.is_paused && !was_paused {
+            Some(true)
+        } else if !data.is_paused && was_paused {
+            Some(false)
+        } else {
+            None
+        };
+        if let Some(paused) = transition {
             let playback = state
                 .ctx
                 .sessions
@@ -206,7 +215,7 @@ pub async fn report_playback_progress(
                     position_ticks: data
                         .position_ticks
                         .unwrap_or(0),
-                    is_paused: true,
+                    is_paused: paused,
                     ..PlaybackContext::from_parts(
                         &session,
                         &data,

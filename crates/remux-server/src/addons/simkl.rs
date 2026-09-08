@@ -21,7 +21,7 @@ use super::{
         AuthFlow, DeviceAuthPoll, DeviceAuthStart, MediaTrackerAddon,
         MediaTrackerCapabilities, MediaTrackerCredentials, MediaTrackerCtx,
         MediaTrackerError, MediaTrackerEvent, MediaTrackerEventKind,
-        MediaTrackerResult, MediaTrackerTarget, RemoteWatch, SyncDirection,
+        MediaTrackerResult, MediaTrackerTarget, RemoteKind, RemoteWatch, SyncDirection,
     },
 };
 use crate::{
@@ -94,9 +94,9 @@ const DEFAULT_PIN_INTERVAL_SECS: i64 = 5;
 const DEFAULT_PIN_EXPIRY_SECS: i64 = 900;
 /// The scrobble endpoints lock an item per user for this long.
 const SCROBBLE_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(20);
-/// Simkl's stated ceiling is one POST per second; a 429 without Retry-After
-/// gets this much room.
-const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(5);
+/// Simkl's stated ceiling is one POST per second; a 429 whose Retry-After is
+/// missing or shorter gets at least this much room.
+const MIN_RETRY_AFTER: Duration = Duration::from_secs(5);
 /// Clocks differ; a delta pull reaches back this far past the watermark.
 const PULL_OVERLAP: chrono::Duration = chrono::Duration::minutes(5);
 
@@ -114,7 +114,7 @@ fn map_client_error(err: ClientError) -> MediaTrackerError {
         ClientError::RateLimited { retry_after_secs } => {
             MediaTrackerError::retry_after(
                 "Simkl rate limit reached",
-                Duration::from_secs(retry_after_secs.max(1)),
+                Duration::from_secs(retry_after_secs.max(MIN_RETRY_AFTER.as_secs())),
             )
         }
         ClientError::Http {
@@ -131,10 +131,6 @@ fn map_client_error(err: ClientError) -> MediaTrackerError {
             412 => MediaTrackerError::permanent(format!(
                 "Simkl rejected the Client ID, check the addon settings ({message})"
             )),
-            429 => MediaTrackerError::retry_after(
-                "Simkl rate limit reached",
-                DEFAULT_RETRY_AFTER,
-            ),
             500..=599 => MediaTrackerError::retryable(format!(
                 "Simkl returned {status}: {message}"
             )),
@@ -142,14 +138,25 @@ fn map_client_error(err: ClientError) -> MediaTrackerError {
                 "Simkl returned {status}: {message}"
             )),
         },
-        ClientError::Transport(e) => {
-            MediaTrackerError::retryable(format!("could not reach Simkl: {e}"))
-        }
+        // The url would carry the client id, and this message ends up in the
+        // connection's `last_error`, which users see.
+        ClientError::Transport(e) => MediaTrackerError::retryable(scrub_client_id(
+            &format!("could not reach Simkl: {}", e.without_url()),
+        )),
         ClientError::Json { status, source, .. } => MediaTrackerError::permanent(
             format!("unexpected Simkl response (status {status}): {source}"),
         ),
-        other => MediaTrackerError::permanent(other.to_string()),
+        other => MediaTrackerError::permanent(scrub_client_id(&other.to_string())),
     }
+}
+
+/// Every request url names the client id; a message quoting one must not.
+fn scrub_client_id(message: &str) -> String {
+    static CLIENT_ID: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"client_id=[^&\s)]+").unwrap());
+    CLIENT_ID
+        .replace_all(message, "client_id=<redacted>")
+        .into_owned()
 }
 
 fn simkl_ids(ids: &db::ExternalIds) -> simkl::SimklIds {
@@ -416,93 +423,121 @@ fn push_remote_watches(
     entry: &simkl::ListEntry,
     is_anime: bool,
 ) {
-    {
-        let Some(item) = entry.item() else {
-            return;
+    let Some(item) = entry.item() else {
+        return;
+    };
+    let ids = external_ids(&item.ids);
+    if !has_local_ids(&ids) {
+        debug!(
+            title = ?item.title,
+            "simkl: skipping an item with no imdb, tmdb, tvdb or kitsu id"
+        );
+        return;
+    }
+    let rating = entry
+        .user_rating
+        .map(|r| r as f32);
+    let watched_at = entry
+        .last_watched_at
+        .map(|d| d.naive_utc());
+    // Rating an item that is not on any list moves it to Completed on Simkl,
+    // so a completed row is only a watch when Simkl also has a watch date
+    // that is not just the rating's. Otherwise a rating pushed from here
+    // would come back as a play.
+    let watched = entry.status == Some(simkl::ListStatus::Completed)
+        && entry
+            .last_watched_at
+            .is_some()
+        && entry.last_watched_at != entry.user_rated_at;
+
+    if entry.is_movie() {
+        out.push(RemoteWatch {
+            kind: RemoteKind::Movie,
+            ids,
+            season: None,
+            episode: None,
+            watched,
+            position_ticks: None,
+            watched_at,
+            favorite: None,
+            rating,
+        });
+        return;
+    }
+
+    let is_anime = is_anime
+        || entry
+            .anime_type
+            .is_some();
+    // Anime is numbered per title on Simkl. A library keyed on tvdb, imdb or
+    // tmdb uses TVDB's seasons, which the `tvdb` block gives; one keyed on
+    // kitsu counts the way Simkl does. Each candidate carries only the ids of
+    // the scheme it is numbered in, so it can only land on a matching series.
+    let tvdb_scheme_ids = db::ExternalIds {
+        kitsu: None,
+        ..ids.clone()
+    };
+    let kitsu_scheme_ids = db::ExternalIds {
+        kitsu: ids.kitsu,
+        ..Default::default()
+    };
+    let episode_watch =
+        |ids: db::ExternalIds, season: i64, episode: i64, at| RemoteWatch {
+            kind: RemoteKind::Show,
+            ids,
+            season: Some(season),
+            episode: Some(episode),
+            watched: true,
+            position_ticks: None,
+            watched_at: at,
+            favorite: None,
+            rating: None,
         };
-        let ids = external_ids(&item.ids);
-        if !has_local_ids(&ids) {
-            debug!(
-                title = ?item.title,
-                "simkl: skipping an item with no imdb, tmdb, tvdb or kitsu id"
-            );
-            return;
-        }
-        let rating = entry
-            .user_rating
-            .map(|r| r as f32);
-        let completed = entry.status == Some(simkl::ListStatus::Completed);
-
-        if entry.is_movie() {
-            out.push(RemoteWatch {
-                ids,
-                season: None,
-                episode: None,
-                watched: completed,
-                position_ticks: None,
-                watched_at: entry
-                    .last_watched_at
-                    .map(|d| d.naive_utc()),
-                favorite: None,
-                rating,
-            });
-            return;
-        }
-
-        let is_anime = is_anime
-            || entry
-                .anime_type
-                .is_some();
-        let mut episodes = 0usize;
-        for season in &entry.seasons {
-            for ep in &season.episodes {
-                // Anime counts episodes per title; the tvdb mapping puts them
-                // back into the season/episode scheme a library uses.
-                let (s, e) = match ep
+    let mut episodes = 0usize;
+    for season in &entry.seasons {
+        for ep in &season.episodes {
+            let at = ep
+                .watched_at
+                .or(entry.last_watched_at)
+                .map(|d| d.naive_utc());
+            if is_anime {
+                if let Some((s, e)) = ep
                     .tvdb
                     .as_ref()
-                    .filter(|_| is_anime)
+                    .and_then(|t| Some((t.season?, t.episode?)))
+                    .filter(|_| has_local_ids(&tvdb_scheme_ids))
                 {
-                    Some(t) => (t.season, t.episode),
-                    None => (season.number, ep.number),
-                };
-                let (Some(s), Some(e)) = (s, e) else {
-                    continue;
-                };
+                    out.push(episode_watch(tvdb_scheme_ids.clone(), s, e, at));
+                    episodes += 1;
+                }
+                if let (Some(s), Some(e), Some(_)) =
+                    (season.number, ep.number, ids.kitsu)
+                {
+                    out.push(episode_watch(kitsu_scheme_ids.clone(), s, e, at));
+                    episodes += 1;
+                }
+            } else if let (Some(s), Some(e)) = (season.number, ep.number) {
+                out.push(episode_watch(ids.clone(), s, e, at));
                 episodes += 1;
-                out.push(RemoteWatch {
-                    ids: ids.clone(),
-                    season: Some(s),
-                    episode: Some(e),
-                    watched: true,
-                    position_ticks: None,
-                    watched_at: ep
-                        .watched_at
-                        .or(entry.last_watched_at)
-                        .map(|d| d.naive_utc()),
-                    favorite: None,
-                    rating: None,
-                });
             }
         }
+    }
 
-        // The show row carries the rating, and stands in for the episodes when
-        // a completed show came back without them.
-        let show_watched = completed && episodes == 0;
-        if rating.is_some() || show_watched {
-            out.push(RemoteWatch {
-                ids,
-                season: None,
-                episode: None,
-                watched: show_watched,
-                position_ticks: None,
-                watched_at: entry
-                    .last_watched_at
-                    .map(|d| d.naive_utc()),
-                favorite: None,
-                rating,
-            });
-        }
+    // The show row carries the rating, and stands in for the episodes when a
+    // completed show came back without them.
+    let show_watched = watched && episodes == 0;
+    if rating.is_some() || show_watched {
+        out.push(RemoteWatch {
+            kind: RemoteKind::Show,
+            ids,
+            season: None,
+            episode: None,
+            watched: show_watched,
+            position_ticks: None,
+            watched_at,
+            favorite: None,
+            rating,
+        });
     }
 }
 
@@ -754,7 +789,7 @@ impl MediaTrackerAddon for SimklAddon {
             simkl::PinStatus::Pending => DeviceAuthPoll::Pending,
             simkl::PinStatus::Expired => DeviceAuthPoll::Denied,
             simkl::PinStatus::Approved { access_token } => DeviceAuthPoll::Approved(
-                self.credentials_for(access_token, ctx)
+                self.credentials_for(access_token.into_inner(), ctx)
                     .await,
             ),
         })
@@ -799,17 +834,21 @@ impl MediaTrackerAddon for SimklAddon {
                 self.scrobble(&client, &item, progress, ScrobbleVerb::Start)
                     .await
             }
+            // Core only reports the transitions: a pause, and the resume
+            // after it, which Simkl takes as a fresh start.
             MediaTrackerEvent::PlaybackProgress {
                 position_ticks,
                 is_paused,
             } => {
-                if !is_paused {
-                    return Ok(());
-                }
                 let progress = target
                     .progress_percent(*position_ticks)
                     .unwrap_or(0.0);
-                self.scrobble(&client, &item, progress, ScrobbleVerb::Pause)
+                let verb = if *is_paused {
+                    ScrobbleVerb::Pause
+                } else {
+                    ScrobbleVerb::Start
+                };
+                self.scrobble(&client, &item, progress, verb)
                     .await
             }
             MediaTrackerEvent::PlaybackStop {
@@ -892,19 +931,21 @@ impl MediaTrackerAddon for SimklAddon {
         ctx: &MediaTrackerCtx,
     ) -> MediaTrackerResult<Vec<RemoteWatch>> {
         let client = self.user_client(creds, ctx)?;
-        let since = since.map(|s| s.and_utc());
-        if let Some(since) = since {
+        // The watermark is remux's clock and Simkl's stamps are its own, so
+        // both the gate and the fetch reach back the same margin.
+        let floor = since.map(|s| s.and_utc() - PULL_OVERLAP);
+        if let Some(floor) = floor {
             let activities = client
                 .execute(simkl::Activities)
                 .await
                 .map_err(map_client_error)?;
-            if !activities.changed_since(since) {
+            if !activities.changed_since(floor) {
                 debug!("simkl: nothing changed since the last pull");
                 return Ok(Vec::new());
             }
         }
         let items = client
-            .execute(simkl::AllItems::for_sync(since.map(|s| s - PULL_OVERLAP)))
+            .execute(simkl::AllItems::for_sync(floor))
             .await
             .map_err(map_client_error)?;
         Ok(remote_watches(&items))
@@ -1106,13 +1147,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_episode_is_scrobbled_through_its_show() {
+    async fn an_episode_is_scrobbled_through_its_show_and_resumed_after_a_pause() {
         let server = MockServer::start();
         let start = server.mock(|when, then| {
             when.method(Method::POST)
                 .path("/scrobble/start")
                 .json_body_partial(
-                    r#"{"progress": 25.0, "show": {"title": "The Wire", "year": 2002, "ids": {"imdb": "tt0306414", "tvdb": 79126}}, "episode": {"season": 1, "number": 3}}"#,
+                    r#"{"show": {"title": "The Wire", "year": 2002, "ids": {"imdb": "tt0306414", "tvdb": 79126}}, "episode": {"season": 1, "number": 3}}"#,
                 );
             then.status(201)
                 .json_body(serde_json::json!({"action": "start"}));
@@ -1149,7 +1190,7 @@ mod tests {
         )
         .await
         .unwrap();
-        // Progress reports while playing are not pauses.
+        // A resume is a start again, from where it left off.
         a.on_event(
             &MediaTrackerEvent::PlaybackProgress {
                 position_ticks: ticks(1900),
@@ -1161,7 +1202,7 @@ mod tests {
         )
         .await
         .unwrap();
-        start.assert();
+        assert_eq!(start.hits(), 2);
         pause.assert();
     }
 
@@ -1472,6 +1513,15 @@ mod tests {
         };
         assert!(map_client_error(http(503, "internal")).is_retryable());
         assert!(map_client_error(http(400, "RATE_LIMIT")).is_retryable());
+        match map_client_error(ClientError::RateLimited {
+            retry_after_secs: 0,
+        }) {
+            MediaTrackerError::Retryable {
+                retry_after: Some(d),
+                ..
+            } => assert_eq!(d, MIN_RETRY_AFTER, "a missing Retry-After still waits"),
+            other => panic!("expected a retry hint, got {other:?}"),
+        }
         assert!(!map_client_error(http(400, "empty_field")).is_retryable());
         assert!(!map_client_error(http(412, "client_id_failed")).is_retryable());
         assert!(!map_client_error(http(404, "id_err")).is_retryable());
@@ -1641,7 +1691,7 @@ mod tests {
         let items = server.mock(|when, then| {
             when.method(Method::GET)
                 .path("/sync/all-items")
-                .query_param("extended", "full")
+                .query_param("extended", "full_anime_seasons")
                 .query_param("episode_watched_at", "yes")
                 .query_param("include_all_episodes", "yes")
                 .query_param("date_from", "2026-05-01T23:55:00Z");
@@ -1719,18 +1769,11 @@ mod tests {
                 ]}]
             }, {
                 "status": "completed",
+                "last_watched_at": "2026-05-01T00:00:00Z",
                 "show": {"title": "Finished", "ids": {"tmdb": 555}}
             }, {
                 "status": "plantowatch",
                 "show": {"title": "Unmapped", "ids": {"simkl": 7, "mal": 99}}
-            }],
-            "anime": [{
-                "status": "completed",
-                "anime_type": "tv",
-                "show": {"title": "Cowboy Bebop", "ids": {"kitsu": 1, "mal": 1}},
-                "seasons": [{"number": 1, "episodes": [
-                    {"number": 27, "watched_at": "2026-05-15T00:13:09Z", "tvdb": {"season": 2, "episode": 1}}
-                ]}]
             }],
             "movies": [{
                 "status": "plantowatch",
@@ -1750,6 +1793,10 @@ mod tests {
             .collect();
         // Two episodes plus the show row carrying the rating.
         assert_eq!(wire.len(), 3);
+        assert!(
+            wire.iter()
+                .all(|w| w.kind == RemoteKind::Show)
+        );
         let ep1 = wire
             .iter()
             .find(|w| w.episode == Some(1))
@@ -1793,22 +1840,13 @@ mod tests {
                     .episode
                     .is_none()
         );
+        assert_eq!(finished.kind, RemoteKind::Show);
 
         assert!(
             !got.iter()
                 .any(|w| w.ids == db::ExternalIds::default()),
             "items with no local id are dropped"
         );
-
-        let bebop = got
-            .iter()
-            .find(|w| {
-                w.ids
-                    .kitsu
-                    == Some(1)
-            })
-            .unwrap();
-        assert_eq!((bebop.season, bebop.episode), (Some(2), Some(1)));
 
         let later = got
             .iter()
@@ -1820,11 +1858,174 @@ mod tests {
                     == Some("tt0000001")
             })
             .unwrap();
+        assert_eq!(later.kind, RemoteKind::Movie);
         assert!(
             !later.watched
                 && later
                     .rating
                     .is_none()
+        );
+    }
+
+    /// Rating an unlisted movie moves it to Completed on Simkl. That must not
+    /// come back as a watch, or a rating pushed from here would mark the
+    /// movie played on the next pull.
+    #[test]
+    fn a_completed_movie_counts_as_watched_only_with_a_watch_date_of_its_own() {
+        let items: simkl::AllItemsResponse =
+            serde_json::from_value(serde_json::json!({
+                "movies": [{
+                    "status": "completed", "user_rating": 7,
+                    "user_rated_at": "2026-05-01T10:00:00Z",
+                    "last_watched_at": "2026-05-01T10:00:00Z",
+                    "movie": {"title": "Only rated", "ids": {"tmdb": 1}}
+                }, {
+                    "status": "completed", "user_rating": 7,
+                    "user_rated_at": "2026-05-02T10:00:00Z",
+                    "last_watched_at": "2026-05-01T20:00:00Z",
+                    "movie": {"title": "Watched then rated", "ids": {"tmdb": 2}}
+                }, {
+                    "status": "completed",
+                    "movie": {"title": "No date at all", "ids": {"tmdb": 3}}
+                }]
+            }))
+            .unwrap();
+        let got = remote_watches(&items);
+        let by = |tmdb: i64| {
+            got.iter()
+                .find(|w| {
+                    w.ids
+                        .tmdb
+                        == Some(tmdb)
+                })
+                .unwrap()
+        };
+        assert!(!by(1).watched);
+        assert_eq!(by(1).rating, Some(7.0), "the rating still comes through");
+        assert!(by(2).watched);
+        assert!(!by(3).watched);
+    }
+
+    /// Simkl numbers anime per title. A library keyed on tvdb gets TVDB's
+    /// seasons; one keyed on kitsu gets Simkl's numbering; each candidate
+    /// carries only the ids it is valid for.
+    #[test]
+    fn anime_episodes_are_offered_in_the_scheme_each_library_uses() {
+        let items: simkl::AllItemsResponse = serde_json::from_value(serde_json::json!({
+            "anime": [{
+                "status": "watching",
+                "show": {"title": "Both", "ids": {"kitsu": 1, "tvdb": 76885, "mal": 1}},
+                "seasons": [{"number": 1, "episodes": [
+                    {"number": 27, "watched_at": "2026-05-15T00:13:09Z", "tvdb": {"season": 2, "episode": 1}},
+                    {"number": 28, "tvdb": {"season": 2, "episode": null}}
+                ]}]
+            }, {
+                "status": "watching",
+                "show": {"title": "Kitsu only", "ids": {"kitsu": 2, "mal": 2}},
+                "seasons": [{"number": 1, "episodes": [{"number": 5, "tvdb": {"season": 1, "episode": 5}}]}]
+            }]
+        }))
+        .unwrap();
+        let got = remote_watches(&items);
+
+        let tvdb: Vec<_> = got
+            .iter()
+            .filter(|w| {
+                w.ids
+                    .tvdb
+                    == Some(76885)
+            })
+            .collect();
+        assert_eq!(
+            tvdb.len(),
+            1,
+            "an episode with no tvdb mapping is not guessed"
+        );
+        assert_eq!((tvdb[0].season, tvdb[0].episode), (Some(2), Some(1)));
+        assert_eq!(
+            tvdb[0]
+                .ids
+                .kitsu,
+            None
+        );
+
+        let kitsu: Vec<_> = got
+            .iter()
+            .filter(|w| {
+                w.ids
+                    .kitsu
+                    == Some(1)
+            })
+            .collect();
+        assert_eq!(kitsu.len(), 2);
+        assert!(
+            kitsu
+                .iter()
+                .all(|w| w
+                    .ids
+                    .tvdb
+                    .is_none()
+                    && w.season == Some(1))
+        );
+        assert!(
+            kitsu
+                .iter()
+                .any(|w| w.episode == Some(27))
+                && kitsu
+                    .iter()
+                    .any(|w| w.episode == Some(28))
+        );
+
+        let only = got
+            .iter()
+            .filter(|w| {
+                w.ids
+                    .kitsu
+                    == Some(2)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(only.len(), 1, "no tvdb id, so only Simkl's numbering");
+        assert_eq!((only[0].season, only[0].episode), (Some(1), Some(5)));
+    }
+
+    #[test]
+    fn client_ids_are_scrubbed_from_error_text() {
+        let raw = "error sending request for url (http://x/users/settings?client_id=abc-123&app-name=remux)";
+        let scrubbed = scrub_client_id(raw);
+        assert!(!scrubbed.contains("abc-123"), "{scrubbed}");
+        assert!(scrubbed.contains("client_id=<redacted>&app-name=remux"));
+    }
+
+    /// The url of a failed request carries the client id; the message that
+    /// lands in `last_error` must not.
+    #[tokio::test]
+    async fn a_transport_failure_does_not_leak_the_client_id() {
+        let server = MockServer::start();
+        let unreachable = format!("http://127.0.0.1:{}", {
+            // A port nothing listens on: bind, read the port, drop.
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr()
+                .unwrap()
+                .port()
+        });
+        let _ = server;
+        let ctx = MediaTrackerCtx {
+            config: Arc::new(crate::Config {
+                simkl_base_url: unreachable,
+                ..Default::default()
+            }),
+        };
+        let err = SimklAddon {
+            client_id: "top-secret-client-id".into(),
+        }
+        .verify(&creds(), &ctx)
+        .await
+        .unwrap_err();
+        assert!(err.is_retryable());
+        assert!(
+            !err.to_string()
+                .contains("top-secret-client-id"),
+            "leaked: {err}"
         );
     }
 }

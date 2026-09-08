@@ -8,13 +8,17 @@ use crate::{
     state::AppState,
 };
 use dioxus::prelude::*;
-use remux_sdks::remux::{
-    AddonOptionType, BeginMediaTrackerDeviceAuth, ConnectMediaTrackerWithToken,
-    DisconnectMediaTracker, GetUserMediaTrackers, MediaTrackerDeviceAuthDto,
-    MediaTrackerDevicePollRequest, MediaTrackerProviderDto,
-    MediaTrackerTokenConnectRequest, PollMediaTrackerDeviceAuth, SyncMediaTracker,
-    UpdateMediaTracker, UpdateMediaTrackerRequest, UserMediaTrackerDto,
-    UserMediaTrackersDto,
+use remux_sdks::{
+    remux::{
+        AddonOptionType, BeginMediaTrackerDeviceAuth, ConnectMediaTrackerWithToken,
+        DisconnectMediaTracker, GetUserMediaTrackers, MediaTrackerAuthFlow,
+        MediaTrackerConnectionStatus, MediaTrackerDeviceAuthDto,
+        MediaTrackerDevicePollRequest, MediaTrackerDevicePollStatus,
+        MediaTrackerProviderDto, MediaTrackerTokenConnectRequest,
+        PollMediaTrackerDeviceAuth, SyncMediaTracker, UpdateMediaTracker,
+        UpdateMediaTrackerRequest, UserMediaTrackerDto, UserMediaTrackersDto,
+    },
+    ClientError,
 };
 use std::{collections::HashMap, time::Duration};
 use uuid::Uuid;
@@ -45,6 +49,19 @@ fn event_label(kind: &str) -> String {
 fn short_time(dt: impl std::fmt::Display) -> String {
     crate::state::fmt_datetime(dt)
 }
+
+/// A poll that failed for a reason worth waiting out: the code is still
+/// good, so the login goes on.
+fn is_transient(e: &ClientError) -> bool {
+    match e {
+        ClientError::Transport(_) | ClientError::RateLimited { .. } => true,
+        ClientError::Http { status, .. } => matches!(status, 502 | 503 | 504),
+        _ => false,
+    }
+}
+
+/// Consecutive transient poll failures before giving up on a login.
+const MAX_TRANSIENT_POLL_FAILURES: u32 = 3;
 
 /// A device-code login in flight for one provider.
 #[derive(Clone, PartialEq)]
@@ -101,13 +118,19 @@ pub fn MediaTrackersPanel(app_state: AppState, user_id: Uuid) -> Element {
                 .expires_in_secs
                 / interval
                 + 1;
-            for _ in 0..attempts {
-                gloo_timers::future::sleep(Duration::from_secs(interval)).await;
-                if pending
+            // This loop belongs to one code. Once the dialog is closed or a
+            // new code replaces it, nothing here may touch the panel.
+            let started = current.clone();
+            let still_current = move || {
+                pending
                     .peek()
                     .as_ref()
-                    != Some(&current)
-                {
+                    == Some(&started)
+            };
+            let mut transient_failures = 0u32;
+            for _ in 0..attempts {
+                gloo_timers::future::sleep(Duration::from_secs(interval)).await;
+                if !still_current() {
                     return;
                 }
                 let result = client
@@ -123,22 +146,35 @@ pub fn MediaTrackersPanel(app_state: AppState, user_id: Uuid) -> Element {
                         },
                     })
                     .await;
+                if !still_current() {
+                    return;
+                }
                 match result {
-                    Ok(r) if r.status == "approved" => {
-                        pending.set(None);
-                        auth_notice.set(None);
-                        let v = *refresh.peek() + 1;
-                        refresh.set(v);
-                        return;
+                    Ok(r) => match r.status {
+                        MediaTrackerDevicePollStatus::Approved => {
+                            pending.set(None);
+                            auth_notice.set(None);
+                            let v = *refresh.peek() + 1;
+                            refresh.set(v);
+                            return;
+                        }
+                        MediaTrackerDevicePollStatus::Denied => {
+                            pending.set(None);
+                            auth_notice.set(Some(
+                                "The code expired or was declined. Start again.".into(),
+                            ));
+                            return;
+                        }
+                        MediaTrackerDevicePollStatus::Pending => {
+                            transient_failures = 0;
+                        }
+                    },
+                    Err(e)
+                        if is_transient(&e)
+                            && transient_failures + 1 < MAX_TRANSIENT_POLL_FAILURES =>
+                    {
+                        transient_failures += 1;
                     }
-                    Ok(r) if r.status == "denied" => {
-                        pending.set(None);
-                        auth_notice.set(Some(
-                            "The code expired or was declined. Start again.".into(),
-                        ));
-                        return;
-                    }
-                    Ok(_) => {}
                     Err(e) => {
                         pending.set(None);
                         auth_notice.set(Some(e.user_message()));
@@ -146,10 +182,12 @@ pub fn MediaTrackersPanel(app_state: AppState, user_id: Uuid) -> Element {
                     }
                 }
             }
-            pending.set(None);
-            auth_notice.set(Some(
-                "The code expired before it was entered. Start again.".into(),
-            ));
+            if still_current() {
+                pending.set(None);
+                auth_notice.set(Some(
+                    "The code expired before it was entered. Start again.".into(),
+                ));
+            }
         });
     });
 
@@ -166,12 +204,23 @@ pub fn MediaTrackersPanel(app_state: AppState, user_id: Uuid) -> Element {
             }
             if let Some(err) = error.read().as_ref() {
                 ErrorAlert { message: err.clone() }
+                button {
+                    r#type: "button",
+                    class: "btn btn-ghost",
+                    style: "height:30px;font-size:.68rem;padding:0 10px;align-self:flex-start",
+                    onclick: move |_| {
+                        let v = *refresh.peek() + 1;
+                        refresh.set(v);
+                    },
+                    "Retry"
+                }
             }
             if let Some(notice) = auth_notice.read().as_ref() {
                 ErrorAlert { message: notice.clone() }
             }
-            if data.read().is_none() {
+            if data.read().is_none() && error.read().is_none() {
                 LoadingText {}
+            } else if data.read().is_none() {
             } else if data.read().as_ref().map(|d| d.providers.is_empty()).unwrap_or(true) {
                 span { class: "field-hint",
                     "No media tracker addon is installed. Add one (for example Simkl) on the Addons page first."
@@ -183,9 +232,15 @@ pub fn MediaTrackersPanel(app_state: AppState, user_id: Uuid) -> Element {
                             let connection = data.read().as_ref()
                                 .and_then(|d| d.connections.iter().find(|c| c.addon_id == provider.addon_id).cloned());
                             let addon_id = provider.addon_id;
+                            // A new connection state remounts the row, which
+                            // resets its optimistic toggles and hints.
+                            let row_key = match connection.as_ref() {
+                                Some(c) => format!("{addon_id}-{}-{}", c.id, c.updated_at),
+                                None => format!("{addon_id}-none"),
+                            };
                             rsx! {
                                 ProviderRow {
-                                    key: "{addon_id}",
+                                    key: "{row_key}",
                                     app_state: app_state.clone(),
                                     user_id,
                                     provider,
@@ -245,17 +300,28 @@ fn ProviderRow(
     let mut busy = use_signal(|| false);
     let mut row_error = use_signal(|| Option::<String>::None);
     let mut token_fields: Signal<HashMap<String, String>> = use_signal(HashMap::new);
-    let mut sync_started = use_signal(|| false);
+    let mut sync_notice = use_signal(|| Option::<&'static str>::None);
+    // The filter list as the user sees it: flipped at once on a toggle, so
+    // two quick toggles build on each other rather than on the last fetch.
+    let mut filters: Signal<Vec<String>> = use_signal(|| {
+        connection
+            .as_ref()
+            .map(|c| {
+                c.event_filters
+                    .clone()
+            })
+            .unwrap_or_default()
+    });
 
     let addon_id = provider.addon_id;
-    let is_device = provider.auth_flow == "oauth_device_code";
-    let is_token = provider.auth_flow == "token";
+    let is_device = provider.auth_flow == MediaTrackerAuthFlow::OAuthDeviceCode;
+    let is_token = provider.auth_flow == MediaTrackerAuthFlow::Token;
     let connected = connection
         .as_ref()
-        .is_some_and(|c| c.status == "connected");
+        .is_some_and(|c| c.status == MediaTrackerConnectionStatus::Connected);
     let needs_reauth = connection
         .as_ref()
-        .is_some_and(|c| c.status == "auth_expired");
+        .is_some_and(|c| c.status == MediaTrackerConnectionStatus::AuthExpired);
 
     let status_text = match connection.as_ref() {
         None => "Not connected".to_string(),
@@ -265,23 +331,23 @@ fn ProviderRow(
                 .as_deref()
                 .map(|n| format!(" as {n}"))
                 .unwrap_or_default();
-            match c
-                .status
-                .as_str()
-            {
-                "connected" => format!("Connected{who}"),
-                "auth_expired" => format!("Reconnect needed{who}"),
-                other => format!("{other}{who}"),
+            match c.status {
+                MediaTrackerConnectionStatus::Connected => format!("Connected{who}"),
+                MediaTrackerConnectionStatus::AuthExpired => {
+                    format!("Reconnect needed{who}")
+                }
+                MediaTrackerConnectionStatus::Error => format!("Error{who}"),
+                MediaTrackerConnectionStatus::Disconnected => {
+                    format!("Disconnected{who}")
+                }
             }
         }
     };
     let status_color = match connection
         .as_ref()
-        .map(|c| {
-            c.status
-                .as_str()
-        }) {
-        Some("connected") => "var(--success, #3c9)",
+        .map(|c| c.status)
+    {
+        Some(MediaTrackerConnectionStatus::Connected) => "var(--success, #3c9)",
         Some(_) => "var(--error)",
         None => "var(--text-dim)",
     };
@@ -396,7 +462,10 @@ fn ProviderRow(
                     })
                     .await
                 {
-                    Ok(_) => sync_started.set(true),
+                    Ok(r) if r.started => sync_notice.set(Some(
+                        "Pull started. Refresh in a minute to see the result.",
+                    )),
+                    Ok(_) => sync_notice.set(Some("A pull is already running.")),
                     Err(e) => row_error.set(Some(e.user_message())),
                 }
                 busy.set(false);
@@ -404,26 +473,20 @@ fn ProviderRow(
         }
     };
 
-    let current_filters: Vec<String> = connection
-        .as_ref()
-        .map(|c| {
-            c.event_filters
-                .clone()
-        })
-        .unwrap_or_default();
-
     let toggle_event = {
         let client = app_state.clone();
-        let filters = current_filters.clone();
         move |(kind, enabled): (String, bool)| {
             let Some(id) = connection_id else {
                 return;
             };
-            let mut next = filters.clone();
+            let mut next = filters
+                .peek()
+                .clone();
             next.retain(|k| *k != kind);
             if enabled {
                 next.push(kind);
             }
+            filters.set(next.clone());
             let client = client.clone();
             row_error.set(None);
             spawn(async move {
@@ -437,7 +500,7 @@ fn ProviderRow(
                     })
                     .await
                 {
-                    Ok(_) => on_changed.call(()),
+                    Ok(saved) => filters.set(saved.event_filters),
                     Err(e) => row_error.set(Some(e.user_message())),
                 }
             });
@@ -488,6 +551,13 @@ fn ProviderRow(
                                         oninput: move |e| {
                                             token_fields.write().insert(fid.clone(), e.value());
                                         },
+                                        // The panel sits inside the user form;
+                                        // Enter must not save and close it.
+                                        onkeydown: move |e| {
+                                            if e.key() == Key::Enter {
+                                                e.prevent_default();
+                                            }
+                                        },
                                     }
                                     if let Some(desc) = field.description.as_ref() {
                                         span { class: "field-hint", "{desc}" }
@@ -503,7 +573,7 @@ fn ProviderRow(
                 div { style: "display:flex;flex-direction:column;gap:2px",
                     for kind in provider.supported_events.clone() {
                         {
-                            let enabled = current_filters.contains(&kind);
+                            let enabled = filters.read().contains(&kind);
                             let kind_for_toggle = kind.clone();
                             let mut toggle = toggle_event.clone();
                             rsx! {
@@ -525,8 +595,8 @@ fn ProviderRow(
             if let Some(err) = row_error.read().as_ref() {
                 ErrorAlert { message: err.clone() }
             }
-            if *sync_started.read() {
-                span { class: "field-hint", "Pull started. Refresh in a minute to see the result." }
+            if let Some(notice) = *sync_notice.read() {
+                span { class: "field-hint", "{notice}" }
             }
 
             div { style: "display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap",

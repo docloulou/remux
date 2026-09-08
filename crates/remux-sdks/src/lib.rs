@@ -533,7 +533,25 @@ impl<A: Auth + Clone> RestClient<A> {
             .await
             .map_err(|e| match e {
                 reqwest_middleware::Error::Reqwest(e) => ClientError::Transport(e),
-                reqwest_middleware::Error::Middleware(e) => ClientError::Other(e),
+                // The retry middleware hands back the last failure wrapped in
+                // its own error; a transport failure is still one after
+                // three tries, and callers classify on the variant.
+                reqwest_middleware::Error::Middleware(e) => {
+                    match e.downcast::<reqwest_retry::RetryError>() {
+                        Ok(
+                            reqwest_retry::RetryError::WithRetries { err, .. }
+                            | reqwest_retry::RetryError::Error(err),
+                        ) => match err {
+                            reqwest_middleware::Error::Reqwest(e) => {
+                                ClientError::Transport(e)
+                            }
+                            reqwest_middleware::Error::Middleware(e) => {
+                                ClientError::Other(e)
+                            }
+                        },
+                        Err(e) => ClientError::Other(e),
+                    }
+                }
             })?;
 
         let status = resp

@@ -171,6 +171,95 @@ impl Endpoint for DeleteWebhook {
 // the dashboard needs no server types.
 // ---------------------------------------------------------------------------
 
+/// How a user connects to a media tracker.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum_macros::Display,
+    strum_macros::EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum MediaTrackerAuthFlow {
+    /// The user pastes a value; `connect_fields` says what.
+    Token,
+    /// The user enters a code on the provider's site while the server polls.
+    #[serde(rename = "oauth_device_code")]
+    #[strum(serialize = "oauth_device_code")]
+    OAuthDeviceCode,
+    /// Redirect plus callback.
+    #[serde(rename = "oauth_redirect")]
+    #[strum(serialize = "oauth_redirect")]
+    OAuthRedirect,
+}
+
+/// Health of a connection, as the server reports it.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum_macros::Display,
+    strum_macros::EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum MediaTrackerConnectionStatus {
+    Disconnected,
+    Connected,
+    Error,
+    /// Credentials rejected; reconnect.
+    AuthExpired,
+}
+
+/// Whether the last failure was worth retrying.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum_macros::Display,
+    strum_macros::EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum MediaTrackerErrorKindDto {
+    Retryable,
+    Permanent,
+}
+
+/// Where a device-code login stands.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum_macros::Display,
+    strum_macros::EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum MediaTrackerDevicePollStatus {
+    Pending,
+    Approved,
+    /// Declined or expired; start over.
+    Denied,
+}
+
 /// One installed addon that can track watch activity, as offered to a user.
 #[skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -180,8 +269,7 @@ pub struct MediaTrackerProviderDto {
     pub name: String,
     /// The preset id, e.g. `simkl`.
     pub kind: String,
-    /// `token`, `oauth_device_code` or `oauth_redirect`.
-    pub auth_flow: String,
+    pub auth_flow: MediaTrackerAuthFlow,
     /// `token` flows only: what the connect form asks for.
     #[serde(default)]
     pub connect_fields: Vec<AddonOption>,
@@ -204,8 +292,7 @@ pub struct UserMediaTrackerDto {
     pub id: Uuid,
     pub addon_id: Uuid,
     pub user_id: Uuid,
-    /// `connected`, `auth_expired`, `error` or `disconnected`.
-    pub status: String,
+    pub status: MediaTrackerConnectionStatus,
     #[serde(default)]
     pub event_filters: Vec<String>,
     /// The remote account, when the provider reports one.
@@ -213,8 +300,7 @@ pub struct UserMediaTrackerDto {
     pub last_success_at: Option<NaiveDateTime>,
     pub last_error_at: Option<NaiveDateTime>,
     pub last_error: Option<String>,
-    /// `retryable` or `permanent`.
-    pub last_error_kind: Option<String>,
+    pub last_error_kind: Option<MediaTrackerErrorKindDto>,
     /// When remote changes were last pulled; `None` before the first import.
     pub last_pull_at: Option<NaiveDateTime>,
     pub created_at: NaiveDateTime,
@@ -236,7 +322,8 @@ pub struct UserMediaTrackersDto {
 pub struct MediaTrackerDeviceAuthDto {
     pub verification_url: String,
     pub user_code: String,
-    /// Opaque; send it back on every poll.
+    /// Opaque, bound to the user and provider that started this login; send
+    /// it back on every poll.
     pub poll_token: String,
     /// Poll no faster than this.
     pub interval_secs: u64,
@@ -256,8 +343,7 @@ pub struct MediaTrackerDevicePollRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaTrackerDevicePollDto {
-    /// `pending`, `approved` or `denied`. `denied` means start over.
-    pub status: String,
+    pub status: MediaTrackerDevicePollStatus,
     /// Set once approved.
     pub connection: Option<UserMediaTrackerDto>,
 }
@@ -288,6 +374,7 @@ pub struct MediaTrackerSyncRequest {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaTrackerSyncStartedDto {
+    /// `false` when a pull for this connection is already running.
     pub started: bool,
 }
 

@@ -491,10 +491,21 @@ pub trait MediaTrackerAddon: AddonKind + Send + Sync {
     }
 }
 
+/// What a remote item is, so core looks it up in the right namespace: TMDB
+/// movie and TV ids are separate sequences that overlap, and a show's id must
+/// never land on a movie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RemoteKind {
+    Movie,
+    /// A series, or with `season`/`episode` set, a part of one.
+    Show,
+}
+
 /// One item's user data read back from a provider, by `import_history` and
 /// `pull_changes`.
 #[derive(Debug, Clone)]
 pub struct RemoteWatch {
+    pub kind: RemoteKind,
     pub ids: db::ExternalIds,
     pub season: Option<i64>,
     pub episode: Option<i64>,
@@ -790,6 +801,7 @@ mod tests {
     #[test]
     fn remote_user_data_can_carry_a_favourite_on_its_own() {
         let watch = RemoteWatch {
+            kind: RemoteKind::Movie,
             ids: db::ExternalIds {
                 tmdb: Some(603),
                 ..Default::default()
@@ -811,6 +823,7 @@ mod tests {
     #[test]
     fn remote_user_data_can_carry_a_rating_on_its_own() {
         let watch = RemoteWatch {
+            kind: RemoteKind::Movie,
             ids: db::ExternalIds {
                 tmdb: Some(603),
                 ..Default::default()

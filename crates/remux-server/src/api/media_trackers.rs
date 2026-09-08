@@ -9,7 +9,7 @@ use axum::{
     http::StatusCode,
 };
 use remux_macros::{delete, get, post, put};
-use std::{str::FromStr, sync::Arc};
+use std::{str::FromStr, sync::Arc, time::Duration};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -27,11 +27,60 @@ use crate::{
 };
 use axum_anyhow::ApiResult as Result;
 use remux_sdks::remux::{
-    MediaTrackerDeviceAuthDto, MediaTrackerDevicePollDto,
-    MediaTrackerDevicePollRequest, MediaTrackerProviderDto, MediaTrackerSyncRequest,
-    MediaTrackerSyncStartedDto, MediaTrackerTokenConnectRequest,
-    UpdateMediaTrackerRequest, UserMediaTrackerDto, UserMediaTrackersDto,
+    MediaTrackerAuthFlow, MediaTrackerConnectionStatus, MediaTrackerDeviceAuthDto,
+    MediaTrackerDevicePollDto, MediaTrackerDevicePollRequest,
+    MediaTrackerDevicePollStatus, MediaTrackerErrorKindDto, MediaTrackerProviderDto,
+    MediaTrackerSyncRequest, MediaTrackerSyncStartedDto,
+    MediaTrackerTokenConnectRequest, UpdateMediaTrackerRequest, UserMediaTrackerDto,
+    UserMediaTrackersDto,
 };
+
+/// A device-code login in progress. Kept in the in-memory store under an
+/// opaque token for as long as the provider's code is valid, so a poll can
+/// only continue a login the same user started with the same provider.
+struct PendingDeviceAuth {
+    user_id: Uuid,
+    addon_id: Uuid,
+    /// What the provider wants back on each poll.
+    provider_token: String,
+}
+
+const PENDING_AUTH_PREFIX: &str = "media_tracker:device_auth:";
+/// Whatever the provider says, a login that has not finished in this long is
+/// gone.
+const PENDING_AUTH_MAX_TTL: Duration = Duration::from_secs(60 * 60);
+
+fn pending_key(token: &str) -> String {
+    format!("{PENDING_AUTH_PREFIX}{token}")
+}
+
+fn auth_flow_dto(flow: AuthFlow) -> MediaTrackerAuthFlow {
+    match flow {
+        AuthFlow::Token => MediaTrackerAuthFlow::Token,
+        AuthFlow::OAuthDeviceCode => MediaTrackerAuthFlow::OAuthDeviceCode,
+        AuthFlow::OAuthRedirect => MediaTrackerAuthFlow::OAuthRedirect,
+    }
+}
+
+fn status_dto(status: db::MediaTrackerStatus) -> MediaTrackerConnectionStatus {
+    match status {
+        db::MediaTrackerStatus::Disconnected => {
+            MediaTrackerConnectionStatus::Disconnected
+        }
+        db::MediaTrackerStatus::Connected => MediaTrackerConnectionStatus::Connected,
+        db::MediaTrackerStatus::Error => MediaTrackerConnectionStatus::Error,
+        db::MediaTrackerStatus::AuthExpired => {
+            MediaTrackerConnectionStatus::AuthExpired
+        }
+    }
+}
+
+fn error_kind_dto(kind: db::MediaTrackerErrorKind) -> MediaTrackerErrorKindDto {
+    match kind {
+        db::MediaTrackerErrorKind::Retryable => MediaTrackerErrorKindDto::Retryable,
+        db::MediaTrackerErrorKind::Permanent => MediaTrackerErrorKindDto::Permanent,
+    }
+}
 
 fn provider_dto(
     runtime: &AddonRuntime,
@@ -50,9 +99,7 @@ fn provider_dto(
             .preset
             .kind
             .clone(),
-        auth_flow: caps
-            .auth_flow
-            .to_string(),
+        auth_flow: auth_flow_dto(caps.auth_flow),
         connect_fields: caps
             .connect_fields
             .clone(),
@@ -84,9 +131,7 @@ fn tracker_dto(t: db::UserMediaTracker) -> UserMediaTrackerDto {
         id: t.id,
         addon_id: t.addon_id,
         user_id: t.user_id,
-        status: t
-            .status
-            .to_string(),
+        status: status_dto(t.status),
         event_filters: t
             .event_filters
             .iter()
@@ -98,7 +143,7 @@ fn tracker_dto(t: db::UserMediaTracker) -> UserMediaTrackerDto {
         last_error: t.last_error,
         last_error_kind: t
             .last_error_kind
-            .map(|k| k.to_string()),
+            .map(error_kind_dto),
         last_pull_at: t.last_pull_at,
         created_at: t.created_at,
         updated_at: t.updated_at,
@@ -142,16 +187,15 @@ fn provider(
     Ok((addon, caps))
 }
 
-/// The requested event filter checked against what the provider supports, or
-/// the provider's default when the caller left it out.
+/// The requested event filter checked against what the provider supports.
+/// `None` when the caller left it out, so a connect can keep what the user
+/// already had.
 fn parse_filters(
     caps: &MediaTrackerCapabilities,
     filters: Option<Vec<String>>,
-) -> Result<Vec<MediaTrackerEventKind>> {
+) -> Result<Option<Vec<MediaTrackerEventKind>>> {
     let Some(filters) = filters else {
-        return Ok(caps
-            .default_event_filter
-            .clone());
+        return Ok(None);
     };
     let mut out = Vec::with_capacity(filters.len());
     for raw in filters {
@@ -167,7 +211,7 @@ fn parse_filters(
             out.push(kind);
         }
     }
-    Ok(out)
+    Ok(Some(out))
 }
 
 /// A connection belonging to `user`, or 404: another user's connection is
@@ -228,11 +272,12 @@ pub async fn list(
 }
 
 /// Start a device-code login: the response carries the code to show the user
-/// and where they enter it.
+/// and where they enter it. The poll token is minted here and tied to this
+/// user and provider; the provider's own handle never leaves the server.
 #[post("/remux/users/{user_id}/mediatrackers/providers/{addon_id}/device")]
 pub async fn begin_device_auth(
     State(state): State<AppState>,
-    auth::TargetUser(_user): auth::TargetUser,
+    auth::TargetUser(user): auth::TargetUser,
     Path((_, addon_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<MediaTrackerDeviceAuthDto>> {
     let (addon, caps) = provider(&state, addon_id)?;
@@ -244,10 +289,28 @@ pub async fn begin_device_auth(
         .begin_device_auth(&tracker_ctx(&state))
         .await
         .map_err(provider_error)?;
+    let poll_token = Uuid::new_v4()
+        .simple()
+        .to_string();
+    state
+        .ctx
+        .store
+        .save_arc_with_weight(
+            pending_key(&poll_token),
+            Arc::new(PendingDeviceAuth {
+                user_id: user.id,
+                addon_id,
+                provider_token: start.poll_token,
+            }),
+            1,
+            start
+                .expires_in
+                .min(PENDING_AUTH_MAX_TTL),
+        );
     Ok(Json(MediaTrackerDeviceAuthDto {
         verification_url: start.verification_url,
         user_code: start.user_code,
-        poll_token: start.poll_token,
+        poll_token,
         interval_secs: start
             .interval
             .as_secs(),
@@ -258,7 +321,8 @@ pub async fn begin_device_auth(
 }
 
 /// Ask whether the user has approved the code yet. Approval stores the
-/// connection and starts the first import.
+/// connection and starts the first import. A token another user or provider
+/// started is treated as unknown.
 #[post("/remux/users/{user_id}/mediatrackers/providers/{addon_id}/device/poll")]
 pub async fn poll_device_auth(
     State(state): State<AppState>,
@@ -267,34 +331,46 @@ pub async fn poll_device_auth(
     Json(req): Json<MediaTrackerDevicePollRequest>,
 ) -> Result<Json<MediaTrackerDevicePollDto>> {
     let (addon, caps) = provider(&state, addon_id)?;
-    if req
-        .poll_token
-        .trim()
-        .is_empty()
-    {
-        return Err(anyhow::anyhow!("empty poll token")
-            .context_bad_request("pollToken is required"));
-    }
+    let key = pending_key(
+        req.poll_token
+            .trim(),
+    );
+    let pending = state
+        .ctx
+        .store
+        .get::<PendingDeviceAuth>(key.clone())
+        .filter(|p| p.user_id == user.id && p.addon_id == addon_id)
+        .context_not_found("No login in progress for that token; start again")?;
     // Checked before polling so a bad filter never wastes an approval.
     let filters = parse_filters(&caps, req.event_filters)?;
     let poll = addon
-        .poll_device_auth(&req.poll_token, &tracker_ctx(&state))
+        .poll_device_auth(&pending.provider_token, &tracker_ctx(&state))
         .await
         .map_err(provider_error)?;
     let (status, connection) = match poll {
-        DeviceAuthPoll::Pending => ("pending", None),
-        DeviceAuthPoll::Denied => ("denied", None),
+        DeviceAuthPoll::Pending => (MediaTrackerDevicePollStatus::Pending, None),
+        DeviceAuthPoll::Denied => {
+            state
+                .ctx
+                .store
+                .delete(key);
+            (MediaTrackerDevicePollStatus::Denied, None)
+        }
         DeviceAuthPoll::Approved(creds) => {
+            state
+                .ctx
+                .store
+                .delete(key);
             let tracker =
                 service::connect_tracker(&state.ctx, user.id, addon_id, creds, filters)
                     .await?;
-            ("approved", Some(tracker_dto(tracker)))
+            (
+                MediaTrackerDevicePollStatus::Approved,
+                Some(tracker_dto(tracker)),
+            )
         }
     };
-    Ok(Json(MediaTrackerDevicePollDto {
-        status: status.to_string(),
-        connection,
-    }))
+    Ok(Json(MediaTrackerDevicePollDto { status, connection }))
 }
 
 /// Connect with a pasted token or key, for providers that work that way.
@@ -331,7 +407,7 @@ pub async fn update(
 ) -> Result<Json<UserMediaTrackerDto>> {
     let tracker = own_connection(&state, &user, id).await?;
     let (_, caps) = provider(&state, tracker.addon_id)?;
-    let filters = parse_filters(&caps, Some(req.event_filters))?;
+    let filters = parse_filters(&caps, Some(req.event_filters))?.unwrap_or_default();
     db::UserMediaTracker::set_event_filters(
         &state
             .ctx
@@ -405,7 +481,7 @@ pub async fn sync_now(
             .context_bad_request("This provider does not report remote changes"));
     }
     let full = body.map_or(false, |Json(b)| b.full);
-    service::spawn_sync(
+    let started = service::spawn_sync(
         state
             .ctx
             .clone(),
@@ -414,7 +490,7 @@ pub async fn sync_now(
     );
     Ok((
         StatusCode::ACCEPTED,
-        Json(MediaTrackerSyncStartedDto { started: true }),
+        Json(MediaTrackerSyncStartedDto { started }),
     ))
 }
 
@@ -518,7 +594,7 @@ mod tests {
             .find(|p| p.addon_id == addon_id)
             .expect("the simkl addon is offered");
         assert_eq!(provider.kind, "simkl");
-        assert_eq!(provider.auth_flow, "oauth_device_code");
+        assert_eq!(provider.auth_flow, MediaTrackerAuthFlow::OAuthDeviceCode);
         assert!(provider.history_import && provider.pulls_changes);
         assert!(
             provider
@@ -550,6 +626,19 @@ mod tests {
         assert_eq!(start.user_code, "5G6JAH");
         assert_eq!(start.verification_url, "https://simkl.com/pin");
         assert_eq!(start.interval_secs, 5);
+        assert_ne!(
+            start.poll_token, start.user_code,
+            "the provider's code is not the poll token"
+        );
+
+        // A token nobody minted is refused before the provider is asked.
+        server
+            .post(&format!("{base}/providers/{addon_id}/device/poll"))
+            .add_header(h.clone(), v.clone())
+            .json(&json!({ "pollToken": "made-up" }))
+            .expect_failure()
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
 
         // Step 2: not yet.
         let mut pending = mock.mock(|when, then| {
@@ -564,7 +653,7 @@ mod tests {
             .json(&json!({ "pollToken": start.poll_token }))
             .await
             .json();
-        assert_eq!(poll.status, "pending");
+        assert_eq!(poll.status, MediaTrackerDevicePollStatus::Pending);
         assert!(
             poll.connection
                 .is_none()
@@ -606,11 +695,11 @@ mod tests {
             .json(&json!({ "pollToken": start.poll_token }))
             .await
             .json();
-        assert_eq!(poll.status, "approved");
+        assert_eq!(poll.status, MediaTrackerDevicePollStatus::Approved);
         let conn = poll
             .connection
             .expect("an approved poll returns the connection");
-        assert_eq!(conn.status, "connected");
+        assert_eq!(conn.status, MediaTrackerConnectionStatus::Connected);
         assert_eq!(
             conn.account_name
                 .as_deref(),
@@ -654,7 +743,17 @@ mod tests {
             .await
             .assert_status(StatusCode::BAD_REQUEST);
 
-        // A pull can be asked for.
+        // A pull can be asked for, once the import that approval started is done.
+        for _ in 0..50 {
+            if !service::is_syncing(conn.id) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            !service::is_syncing(conn.id),
+            "the first import never finished"
+        );
         let started = server
             .post(&format!("{base}/connections/{}/sync", conn.id))
             .add_header(h.clone(), v.clone())
@@ -700,6 +799,7 @@ mod tests {
             .await;
         let (bob_token, bob_id) = login(&server, "bob", "pw").await;
         let (bh, bv) = auth(&bob_token);
+        let (bh2, bv2) = (bh.clone(), bv.clone());
 
         // Bob can list his own trackers, which offers the provider too.
         let mine: UserMediaTrackersDto = server
@@ -730,7 +830,7 @@ mod tests {
             admin_id,
             addon_id,
             creds,
-            vec![MediaTrackerEventKind::MarkPlayed],
+            Some(vec![MediaTrackerEventKind::MarkPlayed]),
         )
         .await
         .unwrap();
@@ -759,10 +859,45 @@ mod tests {
                 "/remux/users/{bob_id}/mediatrackers/providers/{}/token",
                 Uuid::nil()
             ))
-            .add_header(h, v)
+            .add_header(h.clone(), v.clone())
             .json(&json!({ "fields": {} }))
             .expect_failure()
             .await
             .assert_status(StatusCode::NOT_FOUND);
+
+        // A login the admin started cannot be finished by bob, even with the
+        // token in hand.
+        _mock.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/oauth/pin");
+            then.status(200)
+                .json_body(json!({
+                    "result": "OK", "device_code": "x", "user_code": "ADMIN1",
+                    "verification_uri": "https://simkl.com/pin", "expires_in": 900, "interval": 5
+                }));
+        });
+        let approved = _mock.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/oauth/pin/ADMIN1");
+            then.status(200)
+                .json_body(json!({"result": "OK", "access_token": "stolen"}));
+        });
+        let start: MediaTrackerDeviceAuthDto = server
+            .post(&format!(
+                "/remux/users/{admin_id}/mediatrackers/providers/{addon_id}/device"
+            ))
+            .add_header(h, v)
+            .await
+            .json();
+        server
+            .post(&format!(
+                "/remux/users/{bob_id}/mediatrackers/providers/{addon_id}/device/poll"
+            ))
+            .add_header(bh2, bv2)
+            .json(&json!({ "pollToken": start.poll_token }))
+            .expect_failure()
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+        assert_eq!(approved.hits(), 0, "the provider is never asked");
     }
 }
